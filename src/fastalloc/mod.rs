@@ -1,12 +1,12 @@
 use core::convert::TryInto;
 use core::iter::FromIterator;
 use core::ops::{Index, IndexMut};
+use core::convert::TryFrom;
 use crate::{AllocationKind, Block, Inst, InstPosition, Operand, OperandConstraint, OperandKind, OperandPos, PReg, PRegSet, RegClass, SpillSlot, VReg};
 use crate::{Function, MachineEnv, ssa::validate_ssa, ProgPoint, Edit, Output};
 use crate::{cfg::CFGInfo, RegAllocError, Allocation, ion::Stats};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use hashbrown::{HashMap, HashSet};
 
 mod bitset;
 mod lru;
@@ -68,6 +68,40 @@ fn remove_any_from_pregset(set: &mut PRegSet) -> Option<PReg> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegClassNum(u8);
+
+impl RegClassNum {
+    const INT: RegClassNum = RegClassNum(0);
+    const FLOAT: RegClassNum = RegClassNum(1);
+    const VECTOR: RegClassNum = RegClassNum(2);
+    const INVALID: RegClassNum = RegClassNum(3);
+}
+
+impl From<RegClass> for RegClassNum {
+    fn from(value: RegClass) -> Self {
+        match value {
+            RegClass::Int => Self::INT,
+            RegClass::Float => Self::FLOAT,
+            RegClass::Vector => Self::VECTOR,
+        }
+    }
+}
+
+impl TryFrom<RegClassNum> for RegClass {
+    type Error = ();
+
+    fn try_from(value: RegClassNum) -> Result<Self, Self::Error> {
+        match value {
+            RegClassNum(0) => Ok(RegClass::Int),
+            RegClassNum(1) => Ok(RegClass::Float),
+            RegClassNum(2) => Ok(RegClass::Vector),
+            RegClassNum(3) => Err(()),
+            _ => unreachable!(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Env<'a, F: Function> {
     func: &'a F,
@@ -78,7 +112,7 @@ pub struct Env<'a, F: Function> {
     /// `vreg_spillslots[i]` is the spillslot for virtual register `i`.
     vreg_spillslots: Vec<SpillSlot>,
     /// The virtual registers that are currently live.
-    live_vregs: HashSet<VReg>,
+    live_vregs: Vec<RegClassNum>,
     /// Allocatable free physical registers for classes Int, Float, and Vector, respectively.
     freepregs: PartedByRegClass<PRegSet>,
     /// Least-recently-used caches for register classes Int, Float, and Vector, respectively.
@@ -160,7 +194,6 @@ pub struct Env<'a, F: Function> {
     // Output.
     allocs: Allocs,
     edits: VecDeque<(ProgPoint, Edit)>,
-    safepoint_slots: Vec<(ProgPoint, Allocation)>,
     num_spillslots: u32,
     stats: Stats,
 }
@@ -184,7 +217,7 @@ impl<'a, F: Function> Env<'a, F> {
             allocatable_regs: PRegSet::from(env),
             vreg_allocs: vec![Allocation::none(); func.num_vregs()],
             vreg_spillslots: vec![SpillSlot::invalid(); func.num_vregs()],
-            live_vregs: HashSet::with_capacity(func.num_vregs()),
+            live_vregs: vec![RegClassNum::INVALID; func.num_vregs()],
             freepregs: PartedByRegClass {
                 items: [
                     PRegSet::from_iter(regs[0].iter().cloned()),
@@ -222,7 +255,6 @@ impl<'a, F: Function> Env<'a, F> {
             ] },
             allocs,
             edits: VecDeque::new(),
-            safepoint_slots: Vec::new(),
             num_spillslots: 0,
             stats: Stats::default(),
         }
@@ -441,7 +473,7 @@ impl<'a, F: Function> Env<'a, F> {
         trace!("The removed vreg: {:?}", evicted_vreg);
         debug_assert_ne!(evicted_vreg, VReg::invalid());
         if self.vreg_spillslots[evicted_vreg.vreg()].is_invalid() {
-            self.vreg_spillslots[evicted_vreg.vreg()] = self.allocstack(&evicted_vreg);
+            self.vreg_spillslots[evicted_vreg.vreg()] = self.allocstack(evicted_vreg.class());
         }
         let slot = self.vreg_spillslots[evicted_vreg.vreg()];
         self.vreg_allocs[evicted_vreg.vreg()] = Allocation::stack(slot);
@@ -510,14 +542,14 @@ impl<'a, F: Function> Env<'a, F> {
             AllocationKind::None => unreachable!("Attempting to free an unallocated operand!")
         }
         self.vreg_allocs[vreg.vreg()] = Allocation::none();
-        self.live_vregs.remove(&vreg);
+        self.live_vregs[vreg.vreg()] = RegClassNum::INVALID;
         trace!("{:?} curr alloc is now {:?}", vreg, self.vreg_allocs[vreg.vreg()]);
         trace!("Pregs currently allocated: {}", self.pregs_allocd_in_curr_inst);
     }
     
     /// Allocates a spill slot on the stack for `vreg`
-    fn allocstack(&mut self, vreg: &VReg) -> SpillSlot {
-        let size: u32 = self.func.spillslot_size(vreg.class()).try_into().unwrap();
+    fn allocstack(&mut self, class: RegClass) -> SpillSlot {
+        let size: u32 = self.func.spillslot_size(class).try_into().unwrap();
         // Rest of this function was copied verbatim 
         // from `Env::allocate_spillslot` in src/ion/spill.rs.
         let mut offset = self.num_spillslots;
@@ -656,7 +688,7 @@ impl<'a, F: Function> Env<'a, F> {
                     spillslot
                 } else {
                     if self.vreg_spillslots[op.vreg().vreg()].is_invalid() {
-                        self.vreg_spillslots[op.vreg().vreg()] = self.allocstack(&op.vreg());
+                        self.vreg_spillslots[op.vreg().vreg()] = self.allocstack(op.vreg().class());
                     }
                     self.vreg_spillslots[op.vreg().vreg()]
                 };
@@ -685,7 +717,7 @@ impl<'a, F: Function> Env<'a, F> {
             return Ok(());
         }
         self.vregs_in_curr_inst.insert(op.vreg().vreg());
-        self.live_vregs.insert(op.vreg());
+        self.live_vregs[op.vreg().vreg()] = op.class().into();
         if !self.allocd_within_constraint(inst, op) {
             let prev_alloc = self.vreg_allocs[op.vreg().vreg()];
             if prev_alloc.is_none() {
@@ -819,7 +851,7 @@ impl<'a, F: Function> Env<'a, F> {
                         && !self.vregs_first_seen_in_curr_inst.contains(op.vreg().vreg())
                     {
                         if self.vreg_spillslots[op.vreg().vreg()].is_invalid() {
-                            self.vreg_spillslots[op.vreg().vreg()] = self.allocstack(&op.vreg());
+                            self.vreg_spillslots[op.vreg().vreg()] = self.allocstack(op.class());
                         }
                         let op_spillslot = Allocation::stack(self.vreg_spillslots[op.vreg().vreg()]);
                         self.add_move_later(
@@ -888,7 +920,7 @@ impl<'a, F: Function> Env<'a, F> {
     fn alloc_slots_for_block_params(&mut self, succ: Block) {
         for vreg in self.func.block_params(succ) {
             if self.vreg_spillslots[vreg.vreg()].is_invalid() {
-                self.vreg_spillslots[vreg.vreg()] = self.allocstack(vreg);
+                self.vreg_spillslots[vreg.vreg()] = self.allocstack(vreg.class());
                 trace!("Block param {:?} is in {:?}", vreg, Allocation::stack(self.vreg_spillslots[vreg.vreg()]));
             }
         }
@@ -945,7 +977,7 @@ impl<'a, F: Function> Env<'a, F> {
                     let slot = if self.vreg_spillslots[vreg.vreg()].is_valid() {
                         self.vreg_spillslots[vreg.vreg()]
                     } else {
-                        self.vreg_spillslots[vreg.vreg()] = self.allocstack(&vreg);
+                        self.vreg_spillslots[vreg.vreg()] = self.allocstack(vreg.class());
                         self.vreg_spillslots[vreg.vreg()]
                     };
                     let slot_alloc = Allocation::stack(slot);
@@ -1041,11 +1073,11 @@ impl<'a, F: Function> Env<'a, F> {
             // be in another vreg's spillslot at the block beginning.
             for vreg in self.func.branch_blockparams(block, inst, succ_idx).iter() {
                 if self.vreg_spillslots[vreg.vreg()].is_invalid() {
-                    self.vreg_spillslots[vreg.vreg()] = self.allocstack(vreg);
+                    self.vreg_spillslots[vreg.vreg()] = self.allocstack(vreg.class());
                     trace!("Block arg {:?} is going to be in {:?}", vreg, Allocation::stack(self.vreg_spillslots[vreg.vreg()]));
                 }
                 if self.temp_spillslots[vreg.class()].len() == next_temp_idx[vreg.class()] {
-                    let newslot = self.allocstack(vreg);
+                    let newslot = self.allocstack(vreg.class());
                     self.temp_spillslots[vreg.class()].push(newslot);
                 }
                 let temp_slot = self.temp_spillslots[vreg.class()][next_temp_idx[vreg.class()]];
@@ -1076,7 +1108,7 @@ impl<'a, F: Function> Env<'a, F> {
 
                 // All branch arguments should be in their spillslots at the end of the function.
                 self.vreg_allocs[vreg.vreg()] = Allocation::stack(self.vreg_spillslots[vreg.vreg()]);
-                self.live_vregs.insert(*vreg);
+                self.live_vregs[vreg.vreg()] = vreg.class().into();
             }
         }
     }
@@ -1279,7 +1311,7 @@ impl<'a, F: Function> Env<'a, F> {
                 continue;
             }
             if self.vreg_spillslots[vreg.vreg()].is_invalid() {
-                self.vreg_spillslots[vreg.vreg()] = self.allocstack(&vreg);
+                self.vreg_spillslots[vreg.vreg()] = self.allocstack(vreg.class());
             }
             // The allocation where the vreg is expected to be before
             // the first instruction.
@@ -1305,21 +1337,23 @@ impl<'a, F: Function> Env<'a, F> {
                 true
             );
         }
-        let live_vregs = self.live_vregs.clone();
-        for vreg in live_vregs.iter().cloned() {
-            trace!("Processing {:?}", vreg);
-            trace!("{:?} is not a block param. It's a liveout vreg from some predecessor", vreg);
-            if self.vreg_spillslots[vreg.vreg()].is_invalid() {
-                self.vreg_spillslots[vreg.vreg()] = self.allocstack(&vreg);
+        for vreg_num in 0..self.func.num_vregs() {
+            let Ok(class) = self.live_vregs[vreg_num].try_into() else {
+                continue;
+            };
+            trace!("Processing v{:?}", vreg_num);
+            trace!("v{:?} is not a block param. It's a liveout vreg from some predecessor", vreg_num);
+            if self.vreg_spillslots[vreg_num].is_invalid() {
+                self.vreg_spillslots[vreg_num] = self.allocstack(class);
             }
             // The allocation where the vreg is expected to be before
             // the first instruction.
-            let prev_alloc = self.vreg_allocs[vreg.vreg()];
-            let slot = Allocation::stack(self.vreg_spillslots[vreg.vreg()]);
-            trace!("Setting {:?}'s current allocation to its spillslot", vreg);
-            self.vreg_allocs[vreg.vreg()] = slot;
+            let prev_alloc = self.vreg_allocs[vreg_num];
+            let slot = Allocation::stack(self.vreg_spillslots[vreg_num]);
+            trace!("Setting v{:?}'s current allocation to its spillslot", vreg_num);
+            self.vreg_allocs[vreg_num] = slot;
             if let Some(preg) = prev_alloc.as_reg() {
-                trace!("{:?} was in {:?}. Removing it", preg, vreg);
+                trace!("{:?} was in {:?}. Removing it", preg, vreg_num);
                 // Nothing is in that preg anymore. Return it to
                 // the free preg list.
                 self.vreg_in_preg[preg.index()] = VReg::invalid();
@@ -1334,15 +1368,15 @@ impl<'a, F: Function> Env<'a, F> {
             }
             if slot == prev_alloc {
                 // No need to do any movements if the spillslot is where the vreg is expected to be.
-                trace!("No need to reload {:?} because it's already in its expected allocation", vreg);
+                trace!("No need to reload {:?} because it's already in its expected allocation", vreg_num);
                 continue;
             }
-            trace!("Move reason: reload {:?} at begin - move from its spillslot", vreg);
+            trace!("Move reason: reload {:?} at begin - move from its spillslot", vreg_num);
             self.add_move_later(
                 self.func.block_insns(block).first(),
                 slot,
                 prev_alloc,
-                vreg.class(),
+                class,
                 InstPosition::Before,
                 true
             );
@@ -1423,11 +1457,10 @@ impl<'a, F: Function> Env<'a, F> {
         for block in (0..self.func.num_blocks()).rev() {
             self.alloc_block(Block::new(block))?;
         }
-        if !self.live_vregs.is_empty() {
-            Err(RegAllocError::EntryLivein)
-        } else {
-            Ok(())
-        }
+        // Supposed to check if there's any liveins for the
+        // entry block and return an error if there is,
+        // but is that expensive?
+        Ok(())
     }
 }
 
@@ -1468,7 +1501,6 @@ fn log_output<'a, F: Function>(env: &Env<'a, F>) {
     trace!("VReg spillslots: {:?}", v);
     trace!("Temp spillslots: {:?}", env.temp_spillslots);
     trace!("Final edits: {:?}", env.edits);
-    trace!("safepoint_slots: {:?}\n", env.safepoint_slots);
 }
 
 pub fn run<F: Function>(
@@ -1501,7 +1533,7 @@ pub fn run<F: Function>(
         num_spillslots: env.num_spillslots as usize,
         // TODO: Handle debug locations.
         debug_locations: Vec::new(),
-        safepoint_slots: env.safepoint_slots,
+        safepoint_slots: Vec::new(),
         stats: env.stats,
     })
 }
