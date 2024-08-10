@@ -104,7 +104,7 @@ pub struct Env<'a, F: Function> {
     /// This needs to be kept track of to generate the correct moves in the case where a
     /// single virtual register is used multiple times in a single instruction with
     /// different constraints.
-    use_vregs_saved_and_restored_in_curr_inst: HashSet<VReg>,
+    use_vregs_saved_and_restored_in_curr_inst: Vec<bool>,
     /// Physical registers that were used for late def operands and now free to be
     /// reused for early operands in the current instruction.
     ///
@@ -133,10 +133,10 @@ pub struct Env<'a, F: Function> {
     /// It's also used to determine if the an early operand can reuse a freed def operand's
     /// allocation. And it's also used to determine the edits to be inserted when
     /// allocating a use operand.
-    vregs_first_seen_in_curr_inst: HashSet<VReg>,
+    vregs_first_seen_in_curr_inst: Vec<bool>,
     /// Used to keep track of which vregs have been allocated in the current instruction.
     /// This is used to determine which edits to insert when allocating a use operand.
-    vregs_allocd_in_curr_inst: HashSet<VReg>,
+    vregs_allocd_in_curr_inst: Vec<bool>,
     /// Used to determine if a scratch register is needed for an
     /// instruction's moves during the `process_edit` calls.
     inst_needs_scratch_reg: PartedByRegClass<bool>,
@@ -145,7 +145,7 @@ pub struct Env<'a, F: Function> {
     /// This is used to 
     reused_input_to_reuse_op: Vec<usize>,
     /// The vregs defined or used in the current instruction.
-    vregs_in_curr_inst: HashSet<VReg>,
+    vregs_in_curr_inst: Vec<bool>,
     /// The physical registers allocated to the operands in the current instruction.
     /// Used during eviction to detect eviction of a register that is already in use in the
     /// instruction being processed, implying that there aren't enough registers for allocation.
@@ -205,13 +205,13 @@ impl<'a, F: Function> Env<'a, F> {
             inst_pre_edits: VecDeque::new(),
             inst_post_edits: VecDeque::new(),
             free_after_curr_inst: PartedByRegClass { items: [PRegSet::empty(), PRegSet::empty(), PRegSet::empty()] },
-            vregs_allocd_in_curr_inst: HashSet::with_capacity(func.num_vregs()),
-            use_vregs_saved_and_restored_in_curr_inst: HashSet::with_capacity(func.num_vregs()),
+            vregs_allocd_in_curr_inst: vec![false; func.num_vregs()],
+            use_vregs_saved_and_restored_in_curr_inst: vec![false; func.num_vregs()],
             freed_def_pregs: PartedByRegClass { items: [PRegSet::empty(), PRegSet::empty(), PRegSet::empty()] },
-            vregs_first_seen_in_curr_inst: HashSet::with_capacity(func.num_vregs()),
+            vregs_first_seen_in_curr_inst: vec![false; func.num_vregs()],
             inst_needs_scratch_reg: PartedByRegClass { items: [false, false, false] },
             reused_input_to_reuse_op: vec![usize::MAX; max_operand_len as usize],
-            vregs_in_curr_inst: HashSet::with_capacity(func.num_vregs()),
+            vregs_in_curr_inst: vec![false; func.num_vregs()],
             pregs_allocd_in_curr_inst: PRegSet::empty(),
             dedicated_scratch_regs: PartedByRegClass { items: [
                 env.scratch_by_class[0],
@@ -547,7 +547,7 @@ impl<'a, F: Function> Env<'a, F> {
         // defined value will overwrite it.
         if op.pos() == OperandPos::Early 
             && op.kind() == OperandKind::Use
-            && self.vregs_first_seen_in_curr_inst.contains(&op.vreg())
+            && self.vregs_first_seen_in_curr_inst[op.vreg().vreg()]
         {
             if let Some(freed_def_preg) = remove_any_from_pregset(&mut self.freed_def_pregs[op.class()]) {
                 trace!("Reusing the freed def preg: {}", freed_def_preg);
@@ -682,12 +682,12 @@ impl<'a, F: Function> Env<'a, F> {
             trace!("Allocation for instruction {:?} and operand {:?}: {:?}", inst, op, self.allocs[(inst.index(), op_idx)]);
             return Ok(());
         }
-        self.vregs_in_curr_inst.insert(op.vreg());
+        self.vregs_in_curr_inst[op.vreg().vreg()] = true;
         self.live_vregs.insert(op.vreg());
         if !self.allocd_within_constraint(inst, op) {
             let prev_alloc = self.vreg_allocs[op.vreg().vreg()];
             if prev_alloc.is_none() {
-                self.vregs_first_seen_in_curr_inst.insert(op.vreg());
+                self.vregs_first_seen_in_curr_inst[op.vreg().vreg()] = true;
             }
             self.alloc_operand(inst, op, op_idx, fixed_spillslot)?;
             // Need to insert a move to propagate flow from the current
@@ -810,11 +810,11 @@ impl<'a, F: Function> Env<'a, F> {
                     // move from stack_v0 to p1
                     // 2. use v0 (fixed: p1)
                     
-                    if !self.use_vregs_saved_and_restored_in_curr_inst.contains(&op.vreg())
-                        && !self.vregs_allocd_in_curr_inst.contains(&op.vreg())
+                    if !self.use_vregs_saved_and_restored_in_curr_inst[op.vreg().vreg()]
+                        && !self.vregs_allocd_in_curr_inst[op.vreg().vreg()]
                         // Don't restore after the instruction if it doesn't live past
                         // this instruction.
-                        && !self.vregs_first_seen_in_curr_inst.contains(&op.vreg())
+                        && !self.vregs_first_seen_in_curr_inst[op.vreg().vreg()]
                     {
                         if self.vreg_spillslots[op.vreg().vreg()].is_invalid() {
                             self.vreg_spillslots[op.vreg().vreg()] = self.allocstack(&op.vreg());
@@ -836,7 +836,7 @@ impl<'a, F: Function> Env<'a, F> {
                             InstPosition::After,
                             true,
                         );
-                        self.use_vregs_saved_and_restored_in_curr_inst.insert(op.vreg());
+                        self.use_vregs_saved_and_restored_in_curr_inst[op.vreg().vreg()] = true;
                     } else {
                         self.add_move_later(
                             inst,
@@ -879,7 +879,7 @@ impl<'a, F: Function> Env<'a, F> {
             }
             trace!("Allocation for instruction {:?} and operand {:?}: {:?}", inst, op, self.allocs[(inst.index(), op_idx)]);
         }
-        self.vregs_allocd_in_curr_inst.insert(op.vreg());
+        self.vregs_allocd_in_curr_inst[op.vreg().vreg()] = true;
         Ok(())
     }
 
@@ -932,10 +932,10 @@ impl<'a, F: Function> Env<'a, F> {
 
             let vreg = self.vreg_in_preg[clobbered_preg.index()];
             if vreg != VReg::invalid() {
-                let vreg_isnt_mentioned_in_curr_inst = !self.vregs_in_curr_inst.contains(&vreg);
-                let vreg_lives_past_curr_inst = !self.vregs_first_seen_in_curr_inst.contains(&vreg);
+                let vreg_isnt_mentioned_in_curr_inst = !self.vregs_in_curr_inst[vreg.vreg()];
+                let vreg_lives_past_curr_inst = !self.vregs_first_seen_in_curr_inst[vreg.vreg()];
                 if vreg_isnt_mentioned_in_curr_inst
-                    || (!self.use_vregs_saved_and_restored_in_curr_inst.contains(&vreg)
+                    || (!self.use_vregs_saved_and_restored_in_curr_inst[vreg.vreg()]
                         && vreg_lives_past_curr_inst)
                 {
                     trace!("Adding save and restore edits for {:?}", vreg);
@@ -1242,13 +1242,21 @@ impl<'a, F: Function> Env<'a, F> {
         let scratch_regs = self.get_scratch_regs(inst)?;
         self.process_edits(scratch_regs);
         self.add_freed_regs_to_freelist();
-        self.use_vregs_saved_and_restored_in_curr_inst.clear();
-        self.vregs_first_seen_in_curr_inst.clear();
-        self.vregs_allocd_in_curr_inst.clear();
+        for el in self.vregs_allocd_in_curr_inst.iter_mut() {
+            *el = false;
+        }
+        for el in self.use_vregs_saved_and_restored_in_curr_inst.iter_mut() {
+            *el = false;
+        }
+        for el in self.vregs_first_seen_in_curr_inst.iter_mut() {
+            *el = false;
+        }
+        for el in self.vregs_in_curr_inst.iter_mut() {
+            *el = false;
+        }
         for entry in self.reused_input_to_reuse_op.iter_mut() {
             *entry = usize::MAX;
         }
-        self.vregs_in_curr_inst.clear();
         self.pregs_allocd_in_curr_inst = PRegSet::empty();
         if trace_enabled!() {
             self.log_post_inst_processing_state(inst);
