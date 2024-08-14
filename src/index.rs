@@ -151,6 +151,12 @@ impl InstRange {
     }
 
     #[inline(always)]
+    pub fn forward(from: Inst, to: Inst) -> Self {
+        debug_assert!(from.index() <= to.index());
+        InstRange(from, to)
+    }
+
+    #[inline(always)]
     pub fn first(self) -> Inst {
         debug_assert!(self.len() > 0);
         self.0
