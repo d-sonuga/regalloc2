@@ -1568,10 +1568,7 @@ pub fn run<F: Function>(
     env: &MachineEnv,
     options: &RegallocOptions,
 ) -> Result<Output, RegAllocError> {
-    match options.algorithm {
-        Algorithm::Ion => ion::run(func, env, options.verbose_log, options.validate_ssa),
-        Algorithm::Fastalloc => fastalloc::run(func, env, options.verbose_log, options.validate_ssa)
-    }
+    fastalloc::run(func, env, options.verbose_log, options.validate_ssa)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
