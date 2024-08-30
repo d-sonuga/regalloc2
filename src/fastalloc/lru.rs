@@ -1,8 +1,13 @@
-use alloc::vec::Vec;
+use crate::{PReg, PRegSet, RegClass};
 use alloc::vec;
+use alloc::vec::Vec;
+use core::{
+    fmt,
+    ops::{Index, IndexMut},
+};
 use hashbrown::HashSet;
-use core::{fmt, ops::{IndexMut, Index}};
-use crate::{PReg, RegClass};
+
+const DUMMY_NODE_INDEX: usize = PReg::MAX + 1;
 
 /// A least-recently-used cache organized as a linked list based on a vector.
 pub struct Lru {
@@ -27,19 +32,29 @@ pub struct LruNode {
 
 impl Lru {
     pub fn new(regclass: RegClass, regs: &[PReg]) -> Self {
-        let mut data = vec![LruNode { prev: u8::MAX, next: u8::MAX }; PReg::MAX + 1];
+        let mut data = vec![
+            LruNode {
+                prev: u8::MAX,
+                next: u8::MAX
+            };
+            PReg::MAX + 1
+        ];
         let no_of_regs = regs.len();
         for i in 0..no_of_regs {
             let (reg, prev_reg, next_reg) = (
                 regs[i],
                 regs[i.checked_sub(1).unwrap_or(no_of_regs - 1)],
-                regs[if i >= no_of_regs - 1 { 0 } else { i + 1 }]
+                regs[if i >= no_of_regs - 1 { 0 } else { i + 1 }],
             );
             data[reg.hw_enc()].prev = prev_reg.hw_enc() as u8;
             data[reg.hw_enc()].next = next_reg.hw_enc() as u8;
         }
         Self {
-            head: if regs.is_empty() { u8::MAX } else { regs[0].hw_enc() as u8 },
+            head: if regs.is_empty() {
+                u8::MAX
+            } else {
+                regs[0].hw_enc() as u8
+            },
             data,
             regclass,
         }
@@ -47,7 +62,12 @@ impl Lru {
 
     /// Marks the physical register `preg` as the most recently used
     pub fn poke(&mut self, preg: PReg) {
-        trace!("Before poking: {:?} LRU. head: {:?}, Actual data: {:?}", self.regclass, self.head, self.data);
+        trace!(
+            "Before poking: {:?} LRU. head: {:?}, Actual data: {:?}",
+            self.regclass,
+            self.head,
+            self.data
+        );
         trace!("About to poke {:?} in {:?} LRU", preg, self.regclass);
         let prev_newest = self.head;
         let hw_enc = preg.hw_enc() as u8;
@@ -67,7 +87,12 @@ impl Lru {
 
     /// Gets the least recently used physical register.
     pub fn pop(&mut self) -> PReg {
-        trace!("Before popping: {:?} LRU. head: {:?}, Actual data: {:?}", self.regclass, self.head, self.data);
+        trace!(
+            "Before popping: {:?} LRU. head: {:?}, Actual data: {:?}",
+            self.regclass,
+            self.head,
+            self.data
+        );
         trace!("Popping {:?} LRU", self.regclass);
         if self.is_empty() {
             panic!("LRU is empty");
@@ -80,13 +105,58 @@ impl Lru {
         PReg::new(oldest as usize, self.regclass)
     }
 
+    /// Get the last PReg in the LRU from the set `from`.
+    pub fn last(&self, from: PRegSet) -> Option<PReg> {
+        trace!("Getting the last preg from the LRU in set {from}");
+        if self.is_empty() {
+            panic!("LRU is empty");
+        }
+        let mut last = self.data[self.head as usize].prev;
+        let init_last = last;
+        loop {
+            let preg = PReg::new(last as usize, self.regclass);
+            if from.contains(preg) {
+                return Some(preg);
+            }
+            last = self.data[last as usize].prev;
+            if last == init_last {
+                return None;
+            }
+        }
+    }
+
+    /// Get the last PReg from the LRU for which `f` returns true.
+    pub fn last_satisfying<F: Fn(PReg) -> bool>(&self, f: F) -> Option<PReg> {
+        trace!("Getting the last preg from the LRU satisfying...");
+        if self.is_empty() {
+            panic!("LRU is empty");
+        }
+        let mut last = self.data[self.head as usize].prev;
+        let init_last = last;
+        loop {
+            let preg = PReg::new(last as usize, self.regclass);
+            if f(preg) {
+                return Some(preg);
+            }
+            last = self.data[last as usize].prev;
+            if last == init_last {
+                return None;
+            }
+        }
+    }
+
     /// Splices out a node from the list.
     pub fn remove(&mut self, hw_enc: usize) {
-        trace!("Before removing: {:?} LRU. head: {:?}, Actual data: {:?}", self.regclass, self.head, self.data);
+        trace!(
+            "Before removing: {:?} LRU. head: {:?}, Actual data: {:?}",
+            self.regclass,
+            self.head,
+            self.data
+        );
         trace!("Removing p{hw_enc} from {:?} LRU", self.regclass);
         let (iprev, inext) = (
-            self.data[hw_enc].prev as usize, 
-            self.data[hw_enc].next as usize
+            self.data[hw_enc].prev as usize,
+            self.data[hw_enc].next as usize,
         );
         self.data[iprev].next = self.data[hw_enc].next;
         self.data[inext].prev = self.data[hw_enc].prev;
@@ -106,44 +176,19 @@ impl Lru {
         }
     }
 
-    /// Sets the physical register with hw_enc `hw_enc` to the last in the list.
-    pub fn append(&mut self, hw_enc: usize) {
-        trace!("Before appending: {:?} LRU. head: {:?}, Actual data: {:?}", self.regclass, self.head, self.data);
-        trace!("Appending p{hw_enc} to the {:?} LRU", self.regclass);
-        if self.head != u8::MAX {
-            let head = self.head as usize;
-            let last_node = self.data[head].prev;
-            self.data[last_node as usize].next = hw_enc as u8;
-            self.data[head].prev = hw_enc as u8;
-            self.data[hw_enc].prev = last_node;
-            self.data[hw_enc].next = self.head;
-        } else {
-            self.head = hw_enc as u8;
-            self.data[hw_enc].prev = hw_enc as u8;
-            self.data[hw_enc].next = hw_enc as u8;
-        }
-        trace!("Appended p{hw_enc} to the {:?} LRU", self.regclass);
-        if cfg!(debug_assertions) {
-            self.validate_lru();
-        }
-    }
-
-    pub fn append_and_poke(&mut self, preg: PReg) {
-        self.append(preg.hw_enc());
-        self.poke(preg);
-    }
-
     /// Insert node `i` before node `j` in the list.
     fn insert_before(&mut self, i: u8, j: u8) {
-        trace!("Before inserting: {:?} LRU. head: {:?}, Actual data: {:?}", self.regclass, self.head, self.data);
+        trace!(
+            "Before inserting: {:?} LRU. head: {:?}, Actual data: {:?}",
+            self.regclass,
+            self.head,
+            self.data
+        );
         trace!("Inserting p{i} before {j} in {:?} LRU", self.regclass);
         let prev = self.data[j as usize].prev;
         self.data[prev as usize].next = i;
         self.data[j as usize].prev = i;
-        self.data[i as usize] = LruNode {
-            next: j,
-            prev,
-        };
+        self.data[i as usize] = LruNode { next: j, prev };
         trace!("Done inserting p{i} before {j} in {:?} LRU", self.regclass);
         if cfg!(debug_assertions) {
             self.validate_lru();
@@ -156,14 +201,22 @@ impl Lru {
 
     // Using this to debug.
     fn validate_lru(&self) {
-        trace!("{:?} LRU. head: {:?}, Actual data: {:?}", self.regclass, self.head, self.data);
+        trace!(
+            "{:?} LRU. head: {:?}, Actual data: {:?}",
+            self.regclass,
+            self.head,
+            self.data
+        );
         if self.head != u8::MAX {
             let mut node = self.data[self.head as usize].next;
             let mut seen = HashSet::new();
             while node != self.head {
                 if seen.contains(&node) {
-                    panic!("Cycle detected in {:?} LRU.\n
-                        head: {:?}, actual data: {:?}", self.regclass, self.head, self.data);
+                    panic!(
+                        "Cycle detected in {:?} LRU.\n
+                        head: {:?}, actual data: {:?}",
+                        self.regclass, self.head, self.data
+                    );
                 }
                 seen.insert(node);
                 node = self.data[node as usize].next;
@@ -174,13 +227,26 @@ impl Lru {
                     continue;
                 }
                 if self.data[i].prev == u8::MAX || self.data[i].next == u8::MAX {
-                    panic!("Invalid LRU. p{} next or previous is an invalid value, but not both", i);
+                    panic!(
+                        "Invalid LRU. p{} next or previous is an invalid value, but not both",
+                        i
+                    );
                 }
                 if self.data[self.data[i].prev as usize].next != i as u8 {
-                    panic!("Invalid LRU. p{i} prev is p{:?}, but p{:?} next is {:?}", self.data[i].prev, self.data[i].prev, self.data[self.data[i].prev as usize].next);
+                    panic!(
+                        "Invalid LRU. p{i} prev is p{:?}, but p{:?} next is {:?}",
+                        self.data[i].prev,
+                        self.data[i].prev,
+                        self.data[self.data[i].prev as usize].next
+                    );
                 }
                 if self.data[self.data[i].next as usize].prev != i as u8 {
-                    panic!("Invalid LRU. p{i} next is p{:?}, but p{:?} prev is p{:?}", self.data[i].next, self.data[i].next, self.data[self.data[i].next as usize].prev);
+                    panic!(
+                        "Invalid LRU. p{i} next is p{:?}, but p{:?} prev is p{:?}",
+                        self.data[i].next,
+                        self.data[i].next,
+                        self.data[self.data[i].next as usize].prev
+                    );
                 }
             }
         }
@@ -198,8 +264,11 @@ impl fmt::Debug for Lru {
             let mut seen = HashSet::new();
             while node != self.head {
                 if seen.contains(&node) {
-                    panic!("The {:?} LRU is messed up: 
-                       head: {:?}, {:?} -> p{node}, actual data: {:?}", self.regclass, self.head, data_str, self.data);
+                    panic!(
+                        "The {:?} LRU is messed up: 
+                       head: {:?}, {:?} -> p{node}, actual data: {:?}",
+                        self.regclass, self.head, data_str, self.data
+                    );
                 }
                 seen.insert(node);
                 data_str += &format!(" -> p{}", node);
@@ -244,7 +313,7 @@ impl Lrus {
                 Lru::new(RegClass::Int, int_regs),
                 Lru::new(RegClass::Float, float_regs),
                 Lru::new(RegClass::Vector, vec_regs),
-            ]
+            ],
         }
     }
 }
