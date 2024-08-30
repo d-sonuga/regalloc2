@@ -860,7 +860,7 @@ impl<'a, F: Function> Env<'a, F> {
                     temp,
                     param_alloc,
                     vreg.class(),
-                    InstPosition::Before,
+                    InstPosition::After,
                 );
             }
         }
