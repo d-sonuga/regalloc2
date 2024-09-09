@@ -110,11 +110,11 @@ use smallvec::{smallvec, SmallVec};
 /// A set of errors detected by the regalloc checker.
 #[derive(Clone, Debug)]
 pub struct CheckerErrors {
-    errors: Vec<CheckerError>,
+    pub errors: Vec<CheckerError>,
 }
 
 /// A single error detected by the regalloc checker.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CheckerError {
     MissingAllocation {
         inst: Inst,
