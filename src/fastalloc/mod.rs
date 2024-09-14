@@ -9,6 +9,8 @@ use alloc::vec::Vec;
 use core::convert::TryInto;
 use core::iter::FromIterator;
 use core::ops::{Index, IndexMut};
+use std::fs::OpenOptions;
+use std::io::Write;
 
 mod iter;
 mod lru;
@@ -111,6 +113,9 @@ struct Edits {
     /// currently processed.
     scratch_regs: PartedByRegClass<Option<PReg>>,
     dedicated_scratch_regs: PartedByRegClass<Option<PReg>>,
+    total_edits_len_guess: usize,
+    num_insts: usize,
+    max_operand_len: u32,
 }
 
 impl Edits {
@@ -131,6 +136,9 @@ impl Edits {
             fixed_stack_slots,
             scratch_regs: dedicated_scratch_regs.clone(),
             dedicated_scratch_regs,
+            total_edits_len_guess,
+            num_insts,
+            max_operand_len,
         }
     }
 }
@@ -1280,6 +1288,17 @@ impl<'a, F: Function> Env<'a, F> {
         }
         self.edits.edits.reverse();
         self.build_debug_info();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open("edits-measure")
+            .unwrap();
+        file.write_fmt(
+            format_args!(
+                "\n{} {} {} {}",
+                self.edits.max_operand_len, self.edits.num_insts,
+                self.edits.total_edits_len_guess, self.edits.edits.len()
+            )
+        ).unwrap();
         // Ought to check if there are livein registers
         // then throw an error, but will that be expensive?
         Ok(())
